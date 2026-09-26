@@ -248,6 +248,24 @@ def _validate_s3_uri(s3_uri: str) -> str:
     return s3_uri
 
 
+def _corpus_object_uri(s3_uri: str) -> str:
+    """One object under the corpus prefix. Prefix copies are refused."""
+    source = _validate_s3_uri(s3_uri)
+    corpus_root = f"s3://{CORPUS_BUCKET}/{CORPUS_PREFIX}"
+    if source.endswith("/") or source.rstrip("/") in {f"s3://{CORPUS_BUCKET}", corpus_root}:
+        raise ValueError("refusing to copy a prefix; s3_ls, then copy one object key")
+    if not source.startswith(corpus_root + "/"):
+        raise ValueError(f"object must be under {corpus_root}/")
+    return source
+
+
+def _session_dest_for_object(s3_uri: str, destination: str) -> Path:
+    if destination not in {"", "."}:
+        return _under_session(destination)
+    relative = s3_uri.split(f"/{CORPUS_PREFIX}/", 1)[1]
+    return _under_session(relative)
+
+
 def _run(argv: list[str]) -> str:
     started = time.perf_counter()
     _step("command.start", argv=argv)
@@ -290,31 +308,64 @@ def _run(argv: list[str]) -> str:
 
 
 @tool
-def s3_cp(s3_uri: str, destination: str = ".") -> str:
-    """Copy objects from the corpus bucket into session storage with the AWS CLI.
+def s3_ls(name: str, prefix: str = "") -> str:
+    """List corpus keys with aws s3 ls. Does not copy anything.
 
-    A URI that is the bucket root or ends with / is copied recursively.
-    A URI of a single object is copied into the destination directory.
-    Credentials are the AgentCore runtime execution role.
+    Pass a name fragment from the question, such as "imgaug" or "public-api",
+    and copy only the object keys that look useful.
 
     Args:
-        s3_uri: Source, for example s3://the-corpus-bucket/docs/.
-        destination: Directory under the session mount. "." is the mount root.
+        name: Case-insensitive fragment matched against the object key.
+        prefix: Optional key prefix under the corpus, such as "aleju/".
+    """
+    _step("s3_ls.requested", name=name, prefix=prefix)
+    try:
+        fragment = name.strip().lower()
+        if len(fragment) < 2 or any(char in fragment for char in ("\n", "\r", "\x00", "/")):
+            raise ValueError("name must be 2-200 characters and not a path")
+        if len(fragment) > 200:
+            raise ValueError("name must be 2-200 characters and not a path")
+        extra = prefix.strip().strip("/")
+        if extra and (".." in extra.split("/") or any(char in extra for char in ("\n", "\r", "\x00"))):
+            raise ValueError("invalid prefix")
+        key_prefix = f"{CORPUS_PREFIX}/{extra}".rstrip("/") + "/"
+        listing = _run(["aws", "s3", "ls", f"s3://{CORPUS_BUCKET}/{key_prefix}", "--recursive"])
+        matches: list[str] = []
+        for line in listing.splitlines():
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            key = parts[-1]
+            if fragment in key.lower():
+                matches.append(f"s3://{CORPUS_BUCKET}/{key}")
+        preview = "\n".join(matches[:40])
+        if len(matches) > 40:
+            preview += f"\n...[{len(matches) - 40} more keys]"
+        _step("s3_ls.result", name=fragment, matches=len(matches))
+        return preview or f"no keys under {key_prefix} contain {fragment!r}"
+    except Exception as exc:
+        _step("s3_ls.failed", error=repr(exc), traceback=traceback.format_exc())
+        return f"s3_ls failed: {exc}"
+
+
+@tool
+def s3_cp(s3_uri: str, destination: str = ".") -> str:
+    """Copy one object returned by s3_ls into session storage.
+
+    Prefix copies are refused, including the corpus root. Destination "."
+    keeps the owner/repo path under the session mount.
+
+    Args:
+        s3_uri: One object URI from s3_ls.
+        destination: File path under the session mount. "." uses the key path.
     """
     _step("s3_cp.requested", s3_uri=s3_uri, destination=destination)
     try:
-        source = _validate_s3_uri(s3_uri)
-        dest = _under_session(destination)
-        dest.mkdir(parents=True, exist_ok=True)
-        bucket_root = f"s3://{CORPUS_BUCKET}"
-        recursive = source.endswith("/") or source == bucket_root
-        if source == bucket_root:
-            source = bucket_root + "/"
-        argv = ["aws", "s3", "cp", source, f"{dest}/", "--only-show-errors"]
-        if recursive:
-            argv.append("--recursive")
-        _step("s3_cp.planned", source=source, destination=str(dest), recursive=recursive)
-        return _run(argv)
+        source = _corpus_object_uri(s3_uri)
+        dest = _session_dest_for_object(source, destination)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        _step("s3_cp.planned", source=source, destination=str(dest), recursive=False)
+        return _run(["aws", "s3", "cp", source, str(dest), "--only-show-errors"])
     except Exception as exc:
         _step("s3_cp.failed", error=repr(exc), traceback=traceback.format_exc())
         return f"s3_cp failed: {exc}"
@@ -324,8 +375,7 @@ def s3_cp(s3_uri: str, destination: str = ".") -> str:
 def grep_files(pattern: str, path: str = ".") -> str:
     """Search files already copied into session storage.
 
-    Uses grep -n -R. List the session directory first. Copy from S3 only when
-    the files are not already there.
+    Uses grep -n -R on files already in session storage.
 
     Args:
         pattern: Basic regular expression passed to grep -e.
@@ -409,24 +459,26 @@ def _message_text(message: object) -> str:
 SYSTEM_PROMPT = f"""You answer questions about GitHub READMEs. You do not have a vector database.
 The person will not tell you whether the files are already on disk. You decide.
 
-Corpus, if you need to copy: s3://{CORPUS_BUCKET}/{CORPUS_PREFIX}/
-Files are named <owner>/<repo>.md.
+Corpus bucket: s3://{CORPUS_BUCKET}/{CORPUS_PREFIX}/
+Each repository is one object, named <owner>/<repo>.md.
 Session storage: {SESSION_MOUNT}
 Anything written there stays for this runtime session.
 
-To answer:
-1. Call list_session for the owner or repository the question names. If you do not know the directory, list ".".
-2. If those files are already listed, do not copy them. Call grep_files on that directory.
-3. If the directory is missing or empty, call s3_cp for that prefix, then grep_files.
-4. Answer only with lines grep returned. Include the file path and line number. If grep finds nothing, say so.
+Never copy the bucket or the corpus prefix. Copy only single objects whose names look useful.
 
-Use only list_session, s3_cp, and grep_files.
+To answer:
+1. Call list_session for a likely owner or file. If it is already there, grep it and do not copy it.
+2. If it is not local, call s3_ls with a short name fragment from the question (a project, library, or topic).
+3. Call s3_cp on the few object URIs from that listing that might help. Skip the rest.
+4. Call grep_files on those files. Answer only with lines grep returned, including path and line number.
+
+Use only list_session, s3_ls, s3_cp, and grep_files.
 """
 
 agent = Agent(
     model=KimiInvokeModel(MODEL_ID),
     system_prompt=SYSTEM_PROMPT,
-    tools=[list_session, s3_cp, grep_files],
+    tools=[list_session, s3_ls, s3_cp, grep_files],
     hooks=[StepLogger()],
 )
 
